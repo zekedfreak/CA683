@@ -1,0 +1,415 @@
+Identify which questions asked on Quora are duplicates of questions that have already been asked.
+Methodology Used - Crisp DM
+CRISP-DM, which stands for Cross-Industry Standard Process for Data Mining, is an industry-proven way to guide your data mining efforts. As a methodology, it includes descriptions of the typical phases of a project, the tasks involved with each phase, and an explanation of the relationships between these tasks.
+
+Data Loading as Pandas Dataframe
+The data, Quora Question Pairs, contains a human-labeled training set and a test set. Each record in the training set contains a pair of questions as well as a binary label indicating whether or not the record is a duplicate.
+
+Importing Libraries
+#!pip install xgboost --user
+#!pip install nltk --user
+#!pip install gensim --user
+#!pip install pyemd --user
+#!pip install -U scikit-learn --user
+# !pip install fuzzywuzzy --user
+# !pip install python-Levenshtein --user
+import pandas as pd
+import numpy as np
+from fuzzywuzzy import fuzz
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.feature_extraction.text import TfidfVectorizer
+from copy import deepcopy
+from sklearn.decomposition import TruncatedSVD
+from scipy import sparse
+import gensim
+import gensim.downloader as api
+import nltk
+nltk.download('punkt')
+nltk.download('stopwords')
+from nltk.corpus import stopwords
+from nltk import word_tokenize
+from scipy.spatial.distance import cosine, cityblock, jaccard, canberra, euclidean, minkowski, braycurtis
+from gensim.parsing.preprocessing import preprocess_string, strip_tags, strip_multiple_whitespaces, remove_stopwords, stem_text
+import gc
+import psutil
+from sklearn import linear_model
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+import zipfile
+from tqdm import tqdm_notebook as tqdm
+import tensorflow as tf
+print("TensorFlow version %s" % tf.__version__)
+Reading train.csv from Storage
+df = pd.read_csv('train.csv')
+df = df.drop(['id', 'qid1', 'qid2'], axis=1)
+df.head(5)
+Creating basic features for these question attributes for pre-processing
+As we need to identify some relation between these two attributes for classification and EDA
+
+Function to return length difference between two text attributes
+def LengthDiff(df,a,b):
+    df['len_q1'] = df[a].apply(lambda x: len(str(x)))
+    df['len_q2'] = df[b].apply(lambda x: len(str(x)))
+    # difference in lengths of two questions
+    return df.len_q1 - df.len_q2
+​
+df['diff_len'] = LengthDiff(df,'question1','question2')
+df.head(5)
+Function to return character length difference between two text attributes
+def CharLengthDiff(df,a,b):
+    df['len_char_q1'] = df[a].apply(lambda x: len(''.join(set(str(x).replace(' ', '')))))
+    df['len_char_q2'] = df[b].apply(lambda x: len(''.join(set(str(x).replace(' ', '')))))
+    return df
+df = CharLengthDiff(df,'question1','question2')
+df.head(5)
+Function to return word length difference between two text attributes
+def WordLengthDiff(df,a,b):
+    df['len_word_q1'] = df[a].apply(lambda x: len(str(x).split()))
+    df['len_word_q2'] = df[a].apply(lambda x: len(str(x).split()))
+    return df
+df = WordLengthDiff(df,'question1','question2')
+df.head(5)
+Function to return Common words between two text attributes
+def CommonWord(df,a,b):
+    df['common_words'] = df.apply(lambda x: len(set(str(x[a]).lower().split()).intersection(set(str(x[b]).lower().split()))), axis=1)
+    return df
+df = CommonWord(df,'question1','question2')
+df.head(5)
+fs_1 = ['len_q1', 'len_q2', 'diff_len', 'len_char_q1', 
+        'len_char_q2', 'len_word_q1', 'len_word_q2',     
+        'common_words']
+EDA
+Count Plot of is_duplicate Attribute
+def CountPlot(df,col,l=15,b=5,yaxis = ''):
+    figure, ax = plt.subplots(figsize=(l, b))
+    # count plot on single categorical variable
+    sns.countplot(x =col, data = df)
+    plt.title('Total count of each category in '+col+' column')
+    plt.ylabel('Number of ' + yaxis)
+    plt.show()
+print(pd.value_counts(df['is_duplicate'], sort=True, ascending=False))
+CountPlot(df,'is_duplicate')
+Common words in each label (0,1)
+sns.barplot(x = 'is_duplicate', y = 'common_words', data = df)
+plt.xlabel("Duplicate label")
+plt.ylabel("Common words")
+plt.title("Avg Common words in each label")
+plt.show()
+Density Plot of common words in each label
+plt.figure(figsize=(15,10))
+sns.kdeplot(x= "common_words",
+             data=df,
+              hue="is_duplicate")
+plt.xlabel("Common Words")
+plt.ylabel("Density in each label")
+plt.title("Density Plot of common words in each label")
+plt.show()
+Density Plot of difference in length of each label
+plt.figure(figsize=(15,10))
+sns.kdeplot(x= "diff_len",
+             data=df,
+              hue="is_duplicate")
+plt.xlabel("Difference in Length")
+plt.ylabel("Density in each label")
+plt.title("Density Plot of difference in length of each label")
+plt.xlim(-150,150)
+plt.show()
+TEXT PRE-PROCESSING
+Creating fuzzy features
+def Fuzzy_features(df,a,b):
+    df['fuzz_qratio'] = df.apply(lambda x: fuzz.QRatio(str(x[a]), str(x[b])), axis=1)
+    df['fuzz_WRatio'] = df.apply(lambda x: fuzz.WRatio(str(x[a]), str(x[b])), axis=1)
+​
+    df['fuzz_partial_ratio'] = df.apply(lambda x: fuzz.partial_ratio(str(x[a]), str(x[b])), axis=1)
+​
+    df['fuzz_partial_token_set_ratio'] = df.apply(lambda x: fuzz.partial_token_set_ratio(str(x[a]), str(x[b])), axis=1)
+​
+    df['fuzz_partial_token_sort_ratio'] = df.apply(lambda x: fuzz.partial_token_sort_ratio(str(x[a]), str(x[b])), axis=1)
+​
+    df['fuzz_token_set_ratio'] = df.apply(lambda x: fuzz.token_set_ratio(str(x[a]), str(x[b])), axis=1)
+    
+    df['fuzz_token_sort_ratio'] = df.apply(lambda x: fuzz.token_sort_ratio(str(x[a]), str(x[b])), axis=1)
+    return df
+​
+df = Fuzzy_features(df,'question1','question2')
+df.head(5)
+fs_2 = ['fuzz_qratio', 'fuzz_WRatio', 'fuzz_partial_ratio', 
+       'fuzz_partial_token_set_ratio', 'fuzz_partial_token_sort_ratio',
+       'fuzz_token_set_ratio', 'fuzz_token_sort_ratio']
+TF-IDF and SVD features
+tfv_q1 = TfidfVectorizer(min_df=3,max_features=None,strip_accents='unicode',analyzer='word',token_pattern=r'w{1,}',
+                         ngram_range=(1, 2),use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words='english')
+​
+tfv_q2 = deepcopy(tfv_q1)
+Removing Null values if any
+q1_tfidf = tfv_q1.fit_transform(df['question1'].fillna(""))
+q2_tfidf = tfv_q2.fit_transform(df['question2'].fillna(""))
+Applying TruncatedSVD
+A TruncatedSVD is an approximate SVD method that can provide you with reliable yet computationally fast SVD matrix decomposition. You can find more hints about how this technique works and it can be applied by consulting this web
+
+svd_q1 = TruncatedSVD(n_components=8)
+svd_q2 = TruncatedSVD(n_components=8)
+question1_vectors = svd_q1.fit_transform(q1_tfidf)
+question2_vectors = svd_q2.fit_transform(q2_tfidf)
+obtain features by stacking the sparse matrices together
+fs3_1 = sparse.hstack((q1_tfidf, q2_tfidf))
+tfv = TfidfVectorizer(min_df=3, 
+                      max_features=None, 
+                      strip_accents='unicode', 
+                      analyzer='word', 
+                      token_pattern=r'w{1,}',
+                      ngram_range=(1, 2), 
+                      use_idf=1, 
+                      smooth_idf=1, 
+                      sublinear_tf=1,
+                      stop_words='english')
+combine questions and calculate tf-idf
+q1q2 = df.question1.fillna("") 
+q1q2 += " " + df.question2.fillna("")
+fs3_2 = tfv.fit_transform(q1q2)
+obtain features by stacking the matrices together
+fs3_3 = np.hstack((question1_vectors, question2_vectors))
+Creating Word2vec model
+info_datasets = api.info()
+word2vec_model = api.load('word2vec-google-news-300')
+info_datasets
+Using NLTK Library
+stop_words = set(stopwords.words('english'))
+​
+def sent2vec(s, model): 
+    M = []
+    words = word_tokenize(str(s).lower())
+    for word in words:
+        #It shouldn't be a stopword
+        if word not in stop_words:
+            #nor contain numbers
+            if word.isalpha():
+                #and be part of word2vec
+                if word in model:
+                    M.append(model[word])
+    M = np.array(M)
+    if len(M) > 0:
+        v = M.sum(axis=0)
+        return v / np.sqrt((v ** 2).sum())
+    else:
+        return np.zeros(300)
+w2v_q1 = np.array([sent2vec(q, word2vec_model) for q in df.question1])
+w2v_q2 = np.array([sent2vec(q, word2vec_model) for q in df.question2])
+df['cosine_distance'] = [cosine(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['cityblock_distance'] = [cityblock(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['jaccard_distance'] = [jaccard(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['canberra_distance'] = [canberra(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['euclidean_distance'] = [euclidean(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['minkowski_distance'] = [minkowski(x,y,3) for (x,y) in zip(w2v_q1, w2v_q2)]
+df['braycurtis_distance'] = [braycurtis(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+df.head(5)
+fs4_1 = ['cosine_distance', 'cityblock_distance', 
+         'jaccard_distance', 'canberra_distance', 
+         'euclidean_distance', 'minkowski_distance',
+         'braycurtis_distance']
+Word2vec matrices for the two questions are instead horizontally stacked and stored away in the w2v variable for later usage
+w2v = np.hstack((w2v_q1, w2v_q2))
+Word Mover’s Distance function
+Word Mover’s Distance is implemented using a function that returns the distance between two questions, after having transformed them into lowercase and after removing any stopwords
+
+def wmd(s1, s2, model):
+    s1 = str(s1).lower().split()
+    s2 = str(s2).lower().split()
+    stop_words = stopwords.words('english')
+    s1 = [w for w in s1 if w not in stop_words]
+    s2 = [w for w in s2 if w not in stop_words]
+    return model.wmdistance(s1, s2)
+df['wmd'] = df.apply(lambda x: wmd(x['question1'], x['question2'], word2vec_model), axis=1)
+word2vec_model.fill_norms() 
+df['norm_wmd'] = df.apply(lambda x: wmd(x['question1'], x['question2'], word2vec_model), axis=1)
+fs4_2 = ['wmd', 'norm_wmd']
+scaler = StandardScaler()
+y = df.is_duplicate.values
+y = y.astype('float32').reshape(-1, 1)
+X = df[fs_1+fs_2+fs4_1+fs4_2]
+X = X.replace([np.inf, -np.inf], np.nan).fillna(0).values
+X = scaler.fit_transform(X)
+X = np.hstack((X, fs3_3))
+np.random.seed(42)
+n_all, _ = y.shape
+idx = np.arange(n_all)
+np.random.shuffle(idx)
+n_split = n_all // 10
+idx_val = idx[:n_split]
+idx_train = idx[n_split:]
+x_train = X[idx_train]
+y_train = np.ravel(y[idx_train])
+x_val = X[idx_val]
+y_val = np.ravel(y[idx_val])
+logres = linear_model.LogisticRegression(C=0.1, solver='sag', max_iter=1000)
+logres.fit(x_train, y_train)
+lr_preds = logres.predict(x_val)
+log_res_accuracy = np.sum(lr_preds == y_val) / len(y_val)
+print("Logistic regr accuracy: %0.3f" % log_res_accuracy)
+params = dict()
+params['objective'] = 'binary:logistic'
+params['eval_metric'] = ['logloss', 'error']
+params['eta'] = 0.02
+params['max_depth'] = 4
+d_train = xgb.DMatrix(x_train, label=y_train)
+d_valid = xgb.DMatrix(x_val, label=y_val)
+watchlist = [(d_train, 'train'), (d_valid, 'valid')]
+bst = xgb.train(params, d_train, 5000, watchlist, early_stopping_rounds=50, verbose_eval=100)
+xgb_preds = (bst.predict(d_valid) >= 0.5).astype(int)
+xgb_accuracy = np.sum(xgb_preds == y_val) / len(y_val)
+print("Xgb accuracy: %0.3f" % xgb_accuracy)
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
+model = XGBClassifier()
+eval_set = [(x_train, y_train), (x_val, y_val)]
+model.fit(x_train, y_train, eval_metric=["error", "logloss"], eval_set=eval_set, verbose=False)
+    
+    # make predictions for test data
+y_pred = model.predict(x_val)
+predictions = [round(value) for value in y_pred]
+    
+    # evaluate predictions
+accuracy = accuracy_score(y_val, predictions)
+print("Accuracy: %.2f%%" % (accuracy * 100.0))
+results = model.predict(x_val)
+# retrieve performance metrics
+results = model.evals_result()
+epochs = len(results['validation_0']['error'])
+x_axis = range(0, epochs)
+    
+    # plot log loss
+fig, ax = plt.subplots(figsize=(12,12))
+ax.plot(x_axis, results['validation_0']['logloss'], label='Train')
+ax.plot(x_axis, results['validation_1']['logloss'], label='Test')
+ax.legend()
+    
+plt.ylabel('Log Loss')
+plt.title('XGBoost Log Loss')
+plt.show()
+    
+    
+    # plot classification error
+fig, ax = plt.subplots(figsize=(12,12))
+ax.plot(x_axis, results['validation_0']['error'], label='Train')
+ax.plot(x_axis, results['validation_1']['error'], label='Test')
+ax.legend()
+    
+plt.ylabel('Classification Error')
+plt.title('XGBoost Classification Error')
+plt.show()
+Confusion Matrix
+from sklearn.metrics import confusion_matrix
+confusion_matrix(y_val, lr_preds)
+Number of occurrences of each question
+def Transformation(df):
+    df['diff_len'] = LengthDiff(df,'question1','question2')
+    df = CharLengthDiff(df,'question1','question2')
+    df = WordLengthDiff(df,'question1','question2')
+    df = CommonWord(df,'question1','question2')
+    df = Fuzzy_features(df,'question1','question2')
+    tfv_q1 = TfidfVectorizer(min_df=3,max_features=None,strip_accents='unicode',analyzer='word',token_pattern=r'w{1,}',
+                         ngram_range=(1, 2),use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words='english')
+​
+    tfv_q2 = deepcopy(tfv_q1)
+    q1_tfidf = tfv_q1.fit_transform(df['question1'].fillna(""))
+    q2_tfidf = tfv_q2.fit_transform(df['question2'].fillna(""))
+    svd_q1 = TruncatedSVD(n_components=8)
+    svd_q2 = TruncatedSVD(n_components=8)
+    question1_vectors = svd_q1.fit_transform(q1_tfidf)
+    question2_vectors = svd_q2.fit_transform(q2_tfidf)
+    fs3_1 = sparse.hstack((q1_tfidf, q2_tfidf))
+    tfv = TfidfVectorizer(min_df=3, 
+                          max_features=None, 
+                          strip_accents='unicode', 
+                          analyzer='word', 
+                          token_pattern=r'w{1,}',
+                          ngram_range=(1, 2), 
+                          use_idf=1, 
+                          smooth_idf=1, 
+                          sublinear_tf=1,
+                          stop_words='english')
+    q1q2 = df.question1.fillna("") 
+    q1q2 += " " + df.question2.fillna("")
+    fs3_2 = tfv.fit_transform(q1q2)
+    fs3_3 = np.hstack((question1_vectors, question2_vectors))
+    w2v_q1 = np.array([sent2vec(q, word2vec_model) for q in df.question1])
+    w2v_q2 = np.array([sent2vec(q, word2vec_model) for q in df.question2])
+    df['cosine_distance'] = [cosine(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['cityblock_distance'] = [cityblock(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['jaccard_distance'] = [jaccard(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['canberra_distance'] = [canberra(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['euclidean_distance'] = [euclidean(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['minkowski_distance'] = [minkowski(x,y,3) for (x,y) in zip(w2v_q1, w2v_q2)]
+    df['braycurtis_distance'] = [braycurtis(x,y) for (x,y) in zip(w2v_q1, w2v_q2)]
+    w2v = np.hstack((w2v_q1, w2v_q2))
+    df['wmd'] = df.apply(lambda x: wmd(x['question1'], x['question2'], word2vec_model), axis=1)
+    word2vec_model.fill_norms() 
+    df['norm_wmd'] = df.apply(lambda x: wmd(x['question1'], x['question2'], word2vec_model), axis=1)
+    fs4_2 = ['wmd', 'norm_wmd']
+    scaler = StandardScaler()
+    X = df[fs_1+fs_2+fs4_1+fs4_2]
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0).values
+    X = scaler.fit_transform(X)
+    X = np.hstack((X, fs3_3))
+    return X
+df_test = pd.read_csv('test.csv')
+test_id = df_test[['test_id']]
+df_test = df_test.drop(['test_id'], axis=1)
+df_test.head(5)
+X_test= Transformation(df_test)
+logres_final = linear_model.LogisticRegression(C=0.1, solver='sag', max_iter=1000)
+logres_final.fit(X, np.ravel(y))
+lr_preds_final = logres.predict(X_test)
+test_id['is_duplicate'] = list(lr_preds_final)
+test_id['is_duplicate'] = test_id['is_duplicate'].apply(lambda x: int(x))
+test_id.to_csv('Submissions.csv')
+test_id.head(5)
+words having the highest TFIDF score
+df['merge_questions'] = df['question1'] + ' ' + df['question1']
+df.head(5)
+import re
+​
+def pre_process(text):
+    try:
+    
+        # lowercase
+        text=text.lower()
+​
+        #remove tags
+        text=re.sub("","",text)
+​
+        # remove special characters and digits
+        text=re.sub("(\\d|\\W)+"," ",text)
+        return text
+    except:
+        return ''
+fs3_2
+df['merge_questions'] = df['merge_questions'].apply(lambda x:pre_process(x))
+df['merge_questions']
+As dataset is too large, using subset
+from sklearn.feature_extraction.text import CountVectorizer
+docs=df['merge_questions'].tolist()
+docs = docs[:100000]
+vectorizer = CountVectorizer(stop_words='english')
+  
+vectorizer.fit(docs)
+  
+# Printing the identified Unique words along with their indices
+print("Vocabulary: ", vectorizer.vocabulary_)
+  
+# Encode the Document
+vector = vectorizer.transform(docs)
+Top 5 words with highest TDIF socre
+CV = pd.DataFrame(vectorizer.vocabulary_.items(), columns=['Words', 'Count'])
+CV = CV.sort_values(by=['Count'], ascending=False)
+print(CV.head(5))
+CV[:5].plot.bar()
+plt.show()
+CV = pd.DataFrame(vectorizer.vocabulary_.items(), columns=['Words', 'Count'])
+CV = CV.sort_values(by=['Count'], ascending=False)
+print(CV.head(5))
+CV[:5].plot.bar()
+plt.show()
+tf = pd.DataFrame(vector.toarray(), columns=vectorizer.get_feature_names())
+print(tf.head(5))
